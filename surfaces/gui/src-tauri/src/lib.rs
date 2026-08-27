@@ -596,11 +596,20 @@ fn voice_input_compatibility() -> (bool, String, Option<String>) {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn voice_input_compatibility() -> (bool, String, Option<String>) {
-    (
-        true,
-        format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
-        None,
-    )
+    // Unlike macOS (Apple Silicon + 12+) and Windows (x64 + 19045+), there is no useful OS
+    // version or CPU gate here — a Linux box either has a capture device or it doesn't. So ask
+    // that directly. Reporting a blanket "compatible" would let a machine with no microphone
+    // through the whole setup flow, including the 141 MB model download, and fail only when the
+    // user finally presses record.
+    let arch = std::env::consts::ARCH;
+    match ocw_stt::input_device_name() {
+        Some(name) => (true, format!("Linux · {arch} · {name}"), None),
+        None => (
+            false,
+            format!("Linux · {arch}"),
+            Some("No microphone was found. Connect one and reopen Settings.".to_owned()),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -1163,6 +1172,22 @@ mod tests {
                 "start_keep_awake() returned a guard whose inhibitor had already exited"
             );
         }
+    }
+
+    /// Linux's answer must track the machine, not a constant. Exercises whichever branch the
+    /// test host is in: a box with a capture device proves the supported path, one without
+    /// proves the refusal — and CI runners, which have no microphone, are the latter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_voice_support_tracks_the_actual_capture_device() {
+        let (supported, summary, reason) = voice_input_compatibility();
+        eprintln!("voice: supported={supported} summary={summary:?} reason={reason:?}");
+        assert_eq!(
+            supported,
+            ocw_stt::input_device_name().is_some(),
+            "Linux compatibility must reflect whether a capture device actually exists"
+        );
+        assert_eq!(reason.is_some(), !supported, "refusals explain themselves");
     }
 
     /// Whatever a platform reports, the report has to be self-consistent: Settings shows the
