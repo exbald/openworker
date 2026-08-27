@@ -62,6 +62,9 @@ APT_PKGS=(
   libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
   libayatana-appindicator3-dev libssl-dev
   patchelf
+  # Local dictation: cpal needs the ALSA headers, whisper-rs compiles whisper.cpp with cmake
+  # and generates its bindings with libclang.
+  libasound2-dev cmake libclang-dev
 )
 DNF_PKGS=(
   gcc gcc-c++ make pkgconf-pkg-config curl wget file git
@@ -69,6 +72,7 @@ DNF_PKGS=(
   webkit2gtk4.1-devel gtk3-devel librsvg2-devel
   libappindicator-gtk3-devel openssl-devel
   patchelf
+  alsa-lib-devel cmake clang-devel
 )
 
 if have apt-get; then
