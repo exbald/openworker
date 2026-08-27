@@ -26,14 +26,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Voice Input ships on macOS and Windows only. On Linux the engine is swapped for the stub
-// in `dictation_stub` below: linking ocw-stt would drag whisper.cpp (cmake + a C++ toolchain)
-// and ALSA headers into every Linux build — a heavy build-time tax for a feature the released
-// .deb/AppImage don't offer. The Tauri commands are identical either way; the stub simply
-// reports "not installed" and refuses to record.
-#[cfg(target_os = "linux")]
-use dictation_stub::{Dictation, DownloadProgress};
-#[cfg(not(target_os = "linux"))]
 use ocw_stt::{Dictation, DownloadProgress};
 use serde::Serialize;
 use tauri::{
@@ -509,93 +501,6 @@ fn start_window_drag(window: tauri::WebviewWindow) -> bool {
     window.start_dragging().is_ok()
 }
 
-/// Linux stand-in for the `ocw-stt` engine (see the import at the top of this file).
-///
-/// It mirrors exactly the API surface the commands below touch, so there is ONE set of Tauri
-/// commands on every platform — no per-target `#[cfg]` on twelve `#[tauri::command]`s, and no
-/// way for the two paths to drift. Every call answers the way an engine with no model installed
-/// would, and `voice_input_compatibility()` already reports `supported: false` on Linux, so the
-/// GUI dims the mic button before any of this is reachable.
-#[cfg(target_os = "linux")]
-mod dictation_stub {
-    use serde::Serialize;
-    use std::path::PathBuf;
-
-    const UNSUPPORTED: &str = "Voice Input is not available in the Linux build of OpenWorker.";
-
-    #[derive(Debug, Clone, Serialize)]
-    pub struct DictationStatus {
-        pub recording: bool,
-        pub model_installed: bool,
-        pub model_verified: bool,
-        pub test_passed: bool,
-        pub download_in_progress: bool,
-        pub model_name: &'static str,
-        pub model_bytes: u64,
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize)]
-    pub struct DownloadProgress {
-        pub downloaded_bytes: u64,
-        pub total_bytes: u64,
-    }
-
-    pub struct Dictation;
-
-    impl Dictation {
-        pub fn new(_model_dir: impl Into<PathBuf>) -> Self {
-            Self
-        }
-
-        pub fn status(&self) -> DictationStatus {
-            DictationStatus {
-                recording: false,
-                model_installed: false,
-                model_verified: false,
-                test_passed: false,
-                download_in_progress: false,
-                model_name: "none",
-                model_bytes: 0,
-            }
-        }
-
-        pub fn install_default_model_with_progress(
-            &self,
-            _on_progress: impl FnMut(DownloadProgress),
-        ) -> Result<(), String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn verify_default_model(&self) -> Result<(), String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn mark_test_passed(&self) -> Result<(), String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn delete_default_model(&self) -> Result<(), String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn start(&self) -> Result<(), String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn stop_and_transcribe(&self) -> Result<String, String> {
-            Err(UNSUPPORTED.to_owned())
-        }
-
-        pub fn cancel_model_download(&self) {}
-
-        pub fn cancel(&self) {}
-
-        pub fn input_level(&self) -> f32 {
-            0.0
-        }
-    }
-}
-
 // -- local dictation ---------------------------------------------------------------------------
 // The actual microphone/model code lives in the Tauri-free `ocw-stt` crate. This shell owns the
 // macOS permission prompt and translates the reusable API into React-friendly Tauri commands.
@@ -691,13 +596,20 @@ fn voice_input_compatibility() -> (bool, String, Option<String>) {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn voice_input_compatibility() -> (bool, String, Option<String>) {
-    // Not a runtime capability check: the Linux build links the `dictation_stub` engine, so
-    // there is nothing to be compatible WITH. Everything else in the app works the same.
-    (
-        false,
-        format!("{} · {}", std::env::consts::OS, std::env::consts::ARCH),
-        Some("Voice Input is currently supported on macOS and Windows.".to_owned()),
-    )
+    // Unlike macOS (Apple Silicon + 12+) and Windows (x64 + 19045+), there is no useful OS
+    // version or CPU gate here — a Linux box either has a capture device or it doesn't. So ask
+    // that directly. Reporting a blanket "compatible" would let a machine with no microphone
+    // through the whole setup flow, including the 141 MB model download, and fail only when the
+    // user finally presses record.
+    let arch = std::env::consts::ARCH;
+    match ocw_stt::input_device_name() {
+        Some(name) => (true, format!("Linux · {arch} · {name}"), None),
+        None => (
+            false,
+            format!("Linux · {arch}"),
+            Some("No microphone was found. Connect one and reopen Settings.".to_owned()),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -1262,13 +1174,31 @@ mod tests {
         }
     }
 
-    /// Voice Input is compiled out on Linux, and the GUI gates the mic button on this flag —
-    /// so it must stay false there however the stub engine answers.
+    /// Linux's answer must track the machine, not a constant. Exercises whichever branch the
+    /// test host is in: a box with a capture device proves the supported path, one without
+    /// proves the refusal — and CI runners, which have no microphone, are the latter.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn voice_input_is_unsupported_on_linux() {
-        let (supported, _summary, reason) = voice_input_compatibility();
-        if cfg!(target_os = "linux") {
-            assert!(!supported);
+    fn linux_voice_support_tracks_the_actual_capture_device() {
+        let (supported, summary, reason) = voice_input_compatibility();
+        eprintln!("voice: supported={supported} summary={summary:?} reason={reason:?}");
+        assert_eq!(
+            supported,
+            ocw_stt::input_device_name().is_some(),
+            "Linux compatibility must reflect whether a capture device actually exists"
+        );
+        assert_eq!(reason.is_some(), !supported, "refusals explain themselves");
+    }
+
+    /// Whatever a platform reports, the report has to be self-consistent: Settings shows the
+    /// summary beside the mic button, and an unsupported platform must say why or the button
+    /// is simply dead with no explanation. (This replaces an assertion that Linux was
+    /// unsupported — Linux now links the real engine.)
+    #[test]
+    fn voice_input_compatibility_is_self_consistent() {
+        let (supported, summary, reason) = voice_input_compatibility();
+        assert!(!summary.is_empty(), "Settings shows this summary");
+        if !supported {
             assert!(reason.is_some(), "an unsupported platform must say why");
         }
     }
